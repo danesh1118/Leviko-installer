@@ -435,6 +435,10 @@ const T = {
   errD1: { fa: 'خطا در ایجاد پایگاه داده D1', en: 'Failed to create D1 database' },
   errDeploy: { fa: 'خطا در استقرار Worker', en: 'Failed to deploy Worker' },
   errEnableUrl: { fa: 'خطا در فعال‌سازی آدرس workers.dev', en: 'Failed to enable workers.dev URL' },
+  errBinding: {
+    fa: 'اتصال D1 (IOT_DB) به Worker برقرار نشد. بدون این اتصال پنل کار نمی‌کند و خطای 502 می‌دهد. لطفاً در Settings → Bindings دستی اضافه کنید.',
+    en: 'D1 binding (IOT_DB) was not applied to the Worker. Without it the panel will crash with 502. Please add it manually in Settings → Bindings.'
+  },
   warnNoSubdomain: {
     fa: 'ساب‌دامنه workers.dev تنظیم نشده. لطفاً از داشبورد Cloudflare > Workers & Pages > Change subdomain تنظیم کنید',
     en: 'workers.dev subdomain not configured. Please set it from Cloudflare Dashboard > Workers & Pages > Change subdomain'
@@ -876,6 +880,11 @@ async function deployWorkerStable() {
 
   console.log('[Stable] === Multipart PUT upload ===');
 
+  if (!state.dbId) {
+    console.error('[Stable] FATAL: state.dbId is empty — cannot create IOT_DB binding');
+    return { ok: false, msg: 'D1 database ID is missing. Create/select a D1 database first.' };
+  }
+
   const MODULE_FILENAME = 'worker.js';
 
   // Inject config into worker code
@@ -965,6 +974,59 @@ async function verifyBindings() {
     return { ok: !!d1, binding: d1 };
   }
   return { ok: false };
+}
+
+/**
+ * Force-apply IOT_DB D1 binding via the Worker settings API.
+ * Used as a fallback when the multipart upload did not attach the binding.
+ */
+async function forceSetBinding() {
+  if (!state.dbId) {
+    console.error('[Binding] No dbId available — cannot force-set binding');
+    return { ok: false, msg: 'No D1 database ID' };
+  }
+
+  console.log('[Binding] Force-setting IOT_DB binding, dbId:', state.dbId);
+
+  // 1) Read current settings so we don't wipe other bindings
+  const current = await cfFetch(
+    `/accounts/${state.accountId}/workers/scripts/${encodeURIComponent(state.workerName)}/settings`
+  );
+
+  let bindings = [];
+  if (current.success && Array.isArray(current.result?.bindings)) {
+    // Keep every binding that is NOT the old IOT_DB / d1 entry
+    bindings = current.result.bindings.filter(
+      b => b.name !== 'IOT_DB' && b.type !== 'd1'
+    );
+  }
+
+  // 2) Add the correct D1 binding
+  bindings.push({
+    name: 'IOT_DB',
+    type: 'd1',
+    id: state.dbId,
+  });
+
+  const body = { bindings };
+  console.log('[Binding] PUT settings body:', JSON.stringify(body));
+
+  const r = await cfFetch(
+    `/accounts/${state.accountId}/workers/scripts/${encodeURIComponent(state.workerName)}/settings`,
+    { method: 'PUT', body: JSON.stringify(body) }
+  );
+
+  console.log('[Binding] Force-set result:', r.success, 'HTTP:', r._status);
+  if (!r.success) {
+    console.error('[Binding] Force-set ERRORS:', JSON.stringify(r.errors));
+    return { ok: false, msg: r.errors?.[0]?.message || 'Failed to set binding' };
+  }
+
+  // 3) Verify it stuck
+  await new Promise(res => setTimeout(res, 1500));
+  const check = await verifyBindings();
+  console.log('[Binding] Post-force verify:', check.ok);
+  return { ok: check.ok, msg: check.ok ? 'IOT_DB bound' : 'Binding still missing after force-set' };
 }
 
 async function fetchExistingWorkerBindings() {
@@ -1931,16 +1993,39 @@ async function runDeployment() {
     }
   }
 
-  // Step 4: Verification
+  // Step 4: Verification + ensure D1 binding exists
   setProgress('prog-verify', 'active');
-  const waitMs = 5000;
+  const waitMs = 4000;
   await new Promise(resolve => setTimeout(resolve, waitMs));
-  
+
+  // First check whether the multipart upload already attached the binding
+  let bindingCheck = await verifyBindings();
+
+  // If missing, try to force-set it via the settings API (fixes the common 502 cause)
+  if (!bindingCheck.ok) {
+    console.warn('[Verify] IOT_DB binding missing after deploy — attempting force-set');
+    setProgress('prog-verify', 'active', 'Fixing D1 binding…');
+    const forceResult = await forceSetBinding();
+    if (forceResult.ok) {
+      bindingCheck = { ok: true };
+      console.log('[Verify] ✓ Binding fixed by force-set');
+    } else {
+      console.error('[Verify] Force-set failed:', forceResult.msg);
+    }
+  }
+
+  // Hard-fail if binding is still missing — otherwise the panel will 502
+  if (!bindingCheck.ok) {
+    setProgress('prog-verify', 'error');
+    alertEl().innerHTML = alert('error', t('errBinding'));
+    showBtns();
+    return;
+  }
+
   const verifyResult = await verifyDeployment();
-  const bindingCheck = await verifyBindings();
-  const bindingInfo = bindingCheck.ok ? 'D1 ✓' : '';
+  const bindingInfo = 'D1 ✓';
   const urlInfo = state.deployUrl || 'No URL';
-  setProgress('prog-verify', 'done', `${urlInfo}${bindingInfo ? ' | ' + bindingInfo : ''}`);
+  setProgress('prog-verify', 'done', `${urlInfo} | ${bindingInfo}`);
 
   saveCurrentPanel();
 
